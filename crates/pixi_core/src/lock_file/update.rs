@@ -2761,10 +2761,10 @@ fn is_editable_from_manifest(
 fn collect_editable_path_sources(
     manifest_pypi_deps: &pixi_manifest::PyPiDependencies,
     workspace_root: &std::path::Path,
-) -> std::collections::HashMap<String, std::path::PathBuf> {
+) -> HashMap<String, PathBuf> {
     use pixi_pypi_spec::PixiPypiSource;
 
-    let mut map = std::collections::HashMap::new();
+    let mut map = HashMap::new();
     for (name, specs) in manifest_pypi_deps.iter() {
         for spec in specs {
             if let PixiPypiSource::Path {

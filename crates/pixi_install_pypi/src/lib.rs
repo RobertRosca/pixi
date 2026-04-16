@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
 };
@@ -235,7 +235,7 @@ pub struct PyPIEnvironmentUpdater<'a> {
     /// Map from package name (as it appears in the manifest) to the absolute,
     /// non-canonical (symlink-preserving) path.  Used on Unix to patch editable
     /// `.pth` files so they contain both the canonical and the original path.
-    editable_path_sources: HashMap<String, std::path::PathBuf>,
+    editable_path_sources: HashMap<String, PathBuf>,
 }
 
 /// Struct holding (regular distributions, no-build-isolation distributions)
@@ -279,7 +279,7 @@ impl<'a> PyPIEnvironmentUpdater<'a> {
     /// The map key is the package name as it appears in the manifest (may use hyphens).
     /// The value is the absolute, non-canonical path (relative paths are resolved
     /// against the workspace root before being passed here).
-    pub fn with_editable_paths(mut self, paths: HashMap<String, std::path::PathBuf>) -> Self {
+    pub fn with_editable_paths(mut self, paths: HashMap<String, PathBuf>) -> Self {
         self.editable_path_sources = paths;
         self
     }
