@@ -819,8 +819,17 @@ impl<'p> LockFileDerivedData<'p> {
                         .map(to_uv_normalize)
                         .collect::<Result<Vec<_>, _>>()
                         .into_diagnostic()?;
+
+                    // Build a map of editable path packages for `.pth` post-processing.
+                    // We need the original (possibly non-canonical) absolute paths from the
+                    // manifest so that the installer can add them alongside the canonical
+                    // paths that the build backends write.
+                    let editable_path_sources =
+                        collect_editable_path_sources(&manifest_pypi_deps, self.workspace.root());
+
                     PyPIEnvironmentUpdater::new(config, build_config, context_config)
                         .with_ignored_extraneous(names)
+                        .with_editable_paths(editable_path_sources)
                         .update(&python_status, &pixi_records, &pypi_records)
                         .await
                 }
@@ -2740,6 +2749,40 @@ fn is_editable_from_manifest(
         .get(package_name)
         .and_then(|specs| specs.iter().find_map(|spec| spec.editable()))
         .unwrap_or(false)
+}
+
+/// Build a map of `{package_name → absolute_given_path}` for every editable
+/// path-based PyPI dependency in `manifest_pypi_deps`.
+///
+/// Relative paths are resolved against `workspace_root`.  The resulting paths
+/// are *not* canonicalised – they preserve any symlink components exactly as
+/// the user wrote them.  If a package appears multiple times (merged features)
+/// the first path spec with `editable = true` wins.
+fn collect_editable_path_sources(
+    manifest_pypi_deps: &pixi_manifest::PyPiDependencies,
+    workspace_root: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    use pixi_pypi_spec::PixiPypiSource;
+
+    let mut map = std::collections::HashMap::new();
+    for (name, specs) in manifest_pypi_deps.iter() {
+        for spec in specs {
+            if let PixiPypiSource::Path {
+                path,
+                editable: Some(true),
+            } = spec.source()
+            {
+                let abs_path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    workspace_root.join(path)
+                };
+                map.insert(name.as_source().to_owned(), abs_path);
+                break; // first editable-path spec wins
+            }
+        }
+    }
+    map
 }
 
 #[cfg(test)]

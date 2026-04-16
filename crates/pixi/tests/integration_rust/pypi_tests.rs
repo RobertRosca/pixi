@@ -1,4 +1,6 @@
 use std::{fs::File, io::Write, path::Path, str::FromStr};
+#[cfg(unix)]
+use dunce;
 
 use pep508_rs::Requirement;
 use rattler_conda_types::Platform;
@@ -1767,4 +1769,237 @@ version = "0.1.0"
         !has_editable_pth_file(&prefix_path, "editable_test"),
         "Package should NOT be installed as editable when manifest doesn't specify editable = true (even if lock file has editable: true)"
     );
+}
+
+/// Read the non-empty lines of an editable `.pth` file for the given package from
+/// `site-packages`.  Returns `None` if no matching `.pth` file is found.
+fn read_editable_pth_lines(prefix: &Path, package_name: &str) -> Option<Vec<String>> {
+    let site_packages = if cfg!(target_os = "windows") {
+        prefix.join("Lib").join("site-packages")
+    } else {
+        let lib_dir = prefix.join("lib");
+        let entry = fs_err::read_dir(&lib_dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().starts_with("python"))
+            .map(|e| e.path().join("site-packages"))?;
+        entry
+    };
+
+    let normalized_name = package_name.replace('-', "_");
+    let entries = fs_err::read_dir(&site_packages).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.ends_with(".pth") {
+            continue;
+        }
+        let is_match = name_str == format!("_{}.pth", normalized_name)
+            || name_str.starts_with(&format!("__editable__.{}", normalized_name));
+        if is_match {
+            let content = fs_err::read_to_string(entry.path()).ok()?;
+            let lines: Vec<String> = content
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| l.to_owned())
+                .collect();
+            return Some(lines);
+        }
+    }
+    None
+}
+
+/// Test that editable path-based PyPI packages installed through a symlink have their
+/// `.pth` file contain both the canonical path (line 1) and the original
+/// absolute-but-symlink-preserving path (line 2).
+///
+/// When the canonical and given paths are identical (no symlink in the chain) only one
+/// entry must be present (deduplication).
+#[tokio::test]
+#[cfg(unix)]
+#[cfg_attr(
+    any(not(feature = "online_tests"), not(feature = "slow_integration_tests")),
+    ignore
+)]
+async fn test_editable_symlink_pth_has_both_paths() {
+    setup_tracing();
+
+    let platform = Platform::current();
+
+    // Create the initial pixi project (minimal, no pypi deps yet – we'll write the
+    // manifest ourselves once we know the temp-dir path).
+    let pixi = PixiControl::from_manifest(&format!(
+        r#"
+        [workspace]
+        name = "symlink-editable-test"
+        platforms = ["{platform}"]
+        channels = ["https://prefix.dev/conda-forge"]
+
+        [dependencies]
+        python = "~=3.12.0"
+        "#,
+        platform = platform,
+    ))
+    .unwrap();
+
+    let workspace = pixi.workspace_path().to_path_buf();
+
+    // Create the real package source directory.
+    let real_pkg_dir = workspace.join("real_pkg");
+    let src_dir = real_pkg_dir.join("my_package");
+    fs_err::create_dir_all(&src_dir).unwrap();
+    fs_err::write(src_dir.join("__init__.py"), "").unwrap();
+
+    // Use setuptools so the .pth naming is deterministic (__editable__.my_package-…).
+    let pyproject = r#"
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-package"
+version = "0.1.0"
+"#;
+    fs_err::write(real_pkg_dir.join("pyproject.toml"), pyproject).unwrap();
+    fs_err::write(real_pkg_dir.join("setup.cfg"), "[options]\npackages = find:\n").unwrap();
+
+    // Create a symlink that points at the real directory.
+    let symlink_path = workspace.join("symlink_pkg");
+    std::os::unix::fs::symlink(&real_pkg_dir, &symlink_path).unwrap();
+
+    // Sanity-check: symlink_path and its canonical form must differ.
+    let canonical_path = dunce::canonicalize(&symlink_path).unwrap();
+    assert_ne!(
+        canonical_path, symlink_path,
+        "symlink_path should differ from its canonical form"
+    );
+
+    // Rewrite pixi.toml to reference the symlink as an editable dependency.
+    let manifest = format!(
+        r#"
+[workspace]
+name = "symlink-editable-test"
+platforms = ["{platform}"]
+channels = ["https://prefix.dev/conda-forge"]
+
+[dependencies]
+python = "~=3.12.0"
+
+[pypi-dependencies]
+my-package = {{ path = "{symlink}", editable = true }}
+"#,
+        platform = platform,
+        symlink = symlink_path.display(),
+    );
+    fs_err::write(workspace.join("pixi.toml"), manifest).unwrap();
+
+    // Install.
+    pixi.install().await.unwrap();
+
+    let prefix = pixi.default_env_path().unwrap();
+
+    // The .pth file must exist (editable install).
+    let lines = read_editable_pth_lines(&prefix, "my_package")
+        .expect(".pth file for my_package should exist after editable install");
+
+    // First line: canonical path.
+    assert_eq!(
+        lines[0],
+        canonical_path.to_str().unwrap(),
+        "first .pth line should be the canonical path"
+    );
+
+    // Second line: the original symlink path (deduplicated when equal to canonical).
+    assert_eq!(
+        lines.len(),
+        2,
+        ".pth file should contain exactly 2 paths (canonical + symlink), got: {lines:?}"
+    );
+    assert_eq!(
+        lines[1],
+        symlink_path.to_str().unwrap(),
+        "second .pth line should be the symlink (non-canonical) path"
+    );
+}
+
+/// Mirror of the above test but when the path has no symlink component: only one
+/// entry should appear in the `.pth` file (deduplication).
+#[tokio::test]
+#[cfg(unix)]
+#[cfg_attr(
+    any(not(feature = "online_tests"), not(feature = "slow_integration_tests")),
+    ignore
+)]
+async fn test_editable_no_symlink_pth_single_entry() {
+    setup_tracing();
+
+    let platform = Platform::current();
+
+    let pixi = PixiControl::from_manifest(&format!(
+        r#"
+        [workspace]
+        name = "no-symlink-editable-test"
+        platforms = ["{platform}"]
+        channels = ["https://prefix.dev/conda-forge"]
+
+        [dependencies]
+        python = "~=3.12.0"
+        "#,
+        platform = platform,
+    ))
+    .unwrap();
+
+    let workspace = pixi.workspace_path().to_path_buf();
+    let pkg_dir = workspace.join("real_pkg");
+    let src_dir = pkg_dir.join("my_package2");
+    fs_err::create_dir_all(&src_dir).unwrap();
+    fs_err::write(src_dir.join("__init__.py"), "").unwrap();
+
+    let pyproject = r#"
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-package2"
+version = "0.1.0"
+"#;
+    fs_err::write(pkg_dir.join("pyproject.toml"), pyproject).unwrap();
+    fs_err::write(pkg_dir.join("setup.cfg"), "[options]\npackages = find:\n").unwrap();
+
+    // Use a non-symlink absolute path directly.
+    let canonical_path = dunce::canonicalize(&pkg_dir).unwrap();
+
+    let manifest = format!(
+        r#"
+[workspace]
+name = "no-symlink-editable-test"
+platforms = ["{platform}"]
+channels = ["https://prefix.dev/conda-forge"]
+
+[dependencies]
+python = "~=3.12.0"
+
+[pypi-dependencies]
+my-package2 = {{ path = "{pkg}", editable = true }}
+"#,
+        platform = platform,
+        pkg = canonical_path.display(),
+    );
+    fs_err::write(workspace.join("pixi.toml"), manifest).unwrap();
+
+    pixi.install().await.unwrap();
+
+    let prefix = pixi.default_env_path().unwrap();
+
+    let lines = read_editable_pth_lines(&prefix, "my_package2")
+        .expect(".pth file for my_package2 should exist after editable install");
+
+    // When there is no symlink, deduplication means only the canonical path appears.
+    assert_eq!(
+        lines.len(),
+        1,
+        ".pth file should contain exactly 1 path when canonical == given, got: {lines:?}"
+    );
+    assert_eq!(lines[0], canonical_path.to_str().unwrap());
 }

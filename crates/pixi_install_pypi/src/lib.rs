@@ -55,6 +55,7 @@ pub type PyPIRecords = (PypiPackageData, PypiPackageEnvironmentData);
 
 pub(crate) mod conda_pypi_clobber;
 pub(crate) mod conversions;
+pub(crate) mod editable_pth;
 pub(crate) mod install_wheel;
 pub(crate) mod plan;
 pub(crate) mod utils;
@@ -231,6 +232,10 @@ pub struct PyPIEnvironmentUpdater<'a> {
     context_config: PyPIContextConfig<'a>,
     // Names that should never be marked as extraneous in PyPI planning
     ignored_extraneous: HashSet<PackageName>,
+    /// Map from package name (as it appears in the manifest) to the absolute,
+    /// non-canonical (symlink-preserving) path.  Used on Unix to patch editable
+    /// `.pth` files so they contain both the canonical and the original path.
+    editable_path_sources: HashMap<String, std::path::PathBuf>,
 }
 
 /// Struct holding (regular distributions, no-build-isolation distributions)
@@ -252,6 +257,7 @@ impl<'a> PyPIEnvironmentUpdater<'a> {
             build_config,
             context_config,
             ignored_extraneous: Default::default(),
+            editable_path_sources: Default::default(),
         }
     }
 
@@ -263,6 +269,18 @@ impl<'a> PyPIEnvironmentUpdater<'a> {
         I: IntoIterator<Item = PackageName>,
     {
         self.ignored_extraneous = names.into_iter().collect();
+        self
+    }
+
+    /// Supply a map of editable path packages so that their `.pth` files can be
+    /// post-processed to include both the canonical path and the original
+    /// (symlink-preserving) absolute path.
+    ///
+    /// The map key is the package name as it appears in the manifest (may use hyphens).
+    /// The value is the absolute, non-canonical path (relative paths are resolved
+    /// against the workspace root before being passed here).
+    pub fn with_editable_paths(mut self, paths: HashMap<String, std::path::PathBuf>) -> Self {
+        self.editable_path_sources = paths;
         self
     }
 
@@ -322,23 +340,42 @@ impl<'a> PyPIEnvironmentUpdater<'a> {
             .into_diagnostic()
             .with_context(|| "error locking installation directory")?;
 
+        // Determine the purelib (site-packages) directory.  We need this whether or
+        // not there is actual installation work to do, because we may still need to
+        // patch pre-existing editable `.pth` files.
+        let site_packages = planner_config
+            .venv
+            .interpreter()
+            .virtualenv()
+            .purelib
+            .clone();
+
         // Create installation plan
         let installation_plan = self
             .create_installation_plan(pypi_records, &planner_config)
             .await?;
 
-        // Early exit if nothing to do — skip expensive network setup
-        if installation_plan.is_noop() {
+        if !installation_plan.is_noop() {
+            // Expensive setup only when there is real work
+            let setup = self.upgrade_to_full_config(planner_config).await?;
+
+            // Execute the installation plan
+            self.execute_installation_plan(&installation_plan, &setup)
+                .await?;
+        } else {
             tracing::info!("Nothing to do");
-            return Ok(());
         }
 
-        // Expensive setup only when there is real work
-        let setup = self.upgrade_to_full_config(planner_config).await?;
+        // Always patch editable .pth files on Unix so that they contain both the
+        // canonical path and the original symlink-preserving path.
+        #[cfg(unix)]
+        if !self.editable_path_sources.is_empty() {
+            editable_pth::patch_editable_pth_files(&site_packages, &self.editable_path_sources)
+                .into_diagnostic()
+                .wrap_err("failed to patch editable .pth files")?;
+        }
 
-        // Execute the installation plan
-        self.execute_installation_plan(&installation_plan, &setup)
-            .await
+        Ok(())
     }
 
     /// Cheap planning setup — no network I/O.
